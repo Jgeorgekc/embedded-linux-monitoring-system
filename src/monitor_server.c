@@ -56,7 +56,8 @@ void *client_handler(void *arg)
         if(ret <= 0)
         {
             printf("[SERVER] Client disconnected\n");
-
+            printf("[SERVER] Client %d disconnected\n",
+       my_id);
             break;
         }
 
@@ -76,6 +77,7 @@ void *client_handler(void *arg)
 int main()
 {
     signal(SIGINT, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
     shared_data = get_shared_memory();
 
