@@ -7,11 +7,14 @@
 #include <sys/socket.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
 
 #include "shared_mem.h"
 #include "message_queue.h"
 
 #define PORT 8080
+#define MAX_EVENTS 100
 
 sensor_data_t *shared_data;
 message_queue_t queue;
@@ -33,7 +36,23 @@ void signal_handler(int sig)
 {
     running = 0;
 }
+int set_nonblocking(int fd)
+{
+    int flags;
 
+    flags = fcntl(fd,
+                  F_GETFL,
+                  0);
+
+    if(flags < 0)
+    {
+        return -1;
+    }
+
+    return fcntl(fd,
+                 F_SETFL,
+                 flags | O_NONBLOCK);
+}
 void *producer_thread(void *arg)
 {
     int last_temp = -1;
@@ -93,7 +112,7 @@ void *consumer_thread(void *arg)
 
         pthread_mutex_lock(&client_mutex);
 
-        for(int i = 0; i < client_count; i++)
+        for(int i = 0; i < MAX_CLIENTS; i++)
         {
             int ret;
 
@@ -136,6 +155,10 @@ int main()
     
     queue_init(&queue);
 
+    for(int i = 0; i < MAX_CLIENTS; i++)
+    {
+        clients[i] = -1;
+    }
     shared_data = get_shared_memory();
 
     if(shared_data == NULL)
@@ -188,7 +211,29 @@ int main()
     }
 
     printf("[SERVER] Listening on port %d\n", PORT);
+    set_nonblocking(server_fd);
+    int epfd;
 
+    epfd = epoll_create1(0);
+
+    if(epfd < 0)
+    {
+        perror("epoll_create1");
+
+        return -1;
+    }
+
+    struct epoll_event ev;
+    struct epoll_event events[MAX_EVENTS];
+
+    ev.events = EPOLLIN;
+
+    ev.data.fd = server_fd;
+
+    epoll_ctl(epfd,
+            EPOLL_CTL_ADD,
+            server_fd,
+            &ev);
     pthread_t prod_tid;
     pthread_t cons_tid;
 
@@ -204,32 +249,78 @@ int main()
 
     while(running)
     {
-        struct sockaddr_in client_addr;
+        int nfds;
 
-        socklen_t client_len =
-            sizeof(client_addr);
+        nfds = epoll_wait(epfd,
+                        events,
+                        MAX_EVENTS,
+                        -1);
 
-        int client_fd;
-
-        client_fd = accept(server_fd,
-                        (struct sockaddr *)&client_addr,
-                        &client_len);
-
-        if(client_fd < 0)
+        if(nfds < 0)
         {
-            perror("accept");
+            if(errno == EINTR)
+            {
+                continue;
+            }
 
-            continue;
+            perror("epoll_wait");
+
+            break;
         }
 
-        printf("[SERVER] New client connected\n");
+        for(int i = 0; i < nfds; i++)
+        {
+            if(events[i].data.fd == server_fd)
+            {
+                struct sockaddr_in client_addr;
 
-        pthread_mutex_lock(&client_mutex);
+                socklen_t client_len =
+                    sizeof(client_addr);
 
-        clients[client_count++] = client_fd;
+                int client_fd;
 
-        pthread_mutex_unlock(&client_mutex);
+                client_fd = accept(server_fd,
+                                (struct sockaddr *)&client_addr,
+                                &client_len);
 
+                if(client_fd < 0)
+                {
+                    perror("accept");
+
+                    continue;
+                }
+
+                set_nonblocking(client_fd);
+
+                printf("[SERVER] New client connected fd=%d\n",
+                    client_fd);
+
+                pthread_mutex_lock(&client_mutex);
+
+                int added = 0;
+
+                for(int j = 0; j < MAX_CLIENTS; j++)
+                {
+                    if(clients[j] == -1)
+                    {
+                        clients[j] = client_fd;
+
+                        added = 1;
+
+                        break;
+                    }
+                }
+
+                pthread_mutex_unlock(&client_mutex);
+
+                if(!added)
+                {
+                    printf("[SERVER] Max clients reached\n");
+
+                    close(client_fd);
+                }
+            }
+        }
     }
     close(server_fd);
 
