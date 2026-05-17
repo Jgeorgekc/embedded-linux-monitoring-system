@@ -14,6 +14,7 @@
 #include "shared_mem.h"
 #include "message_queue.h"
 #include "client_manager.h"
+#include "protocol.h"
 
 #define PORT 8080
 #define MAX_EVENTS 100
@@ -23,6 +24,9 @@ sensor_data_t *shared_data;
 message_queue_t queue;
 
 pthread_mutex_t client_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
+
+pthread_mutex_t msgid_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 
 int running = 1;
@@ -79,15 +83,22 @@ void *producer_thread(void *arg)
         {
             char buffer[256];
 
+            pthread_mutex_lock(
+                &msgid_mutex);
+
             global_msg_id++;
 
-            snprintf(buffer,
-                     sizeof(buffer),
-                     "ID=%d TEMP=%d HUM=%d PRESS=%d\n",
-                     global_msg_id,
-                     temp,
-                     hum,
-                     press);
+            int current_msg_id =
+                global_msg_id;
+
+            pthread_mutex_unlock(
+                &msgid_mutex);
+
+            create_sensor_packet(buffer,
+                                 current_msg_id,
+                                 temp,
+                                 hum,
+                                 press);
 
             enqueue(&queue,
                     buffer);
@@ -120,7 +131,13 @@ void *consumer_thread(void *arg)
         printf("[QUEUE] Broadcasting: %s",
                msg);
 
-        pthread_mutex_lock(&client_mutex);
+        int msg_id;
+
+        msg_id =
+            parse_ack_packet(msg);
+
+        pthread_mutex_lock(
+            &client_mutex);
 
         for(int i = 0;
             i < MAX_CLIENTS;
@@ -132,11 +149,33 @@ void *consumer_thread(void *arg)
             }
 
             /*
-               overwrite avoid cheyyan
+               previous message pending
             */
 
             if(clients[i].outlen > 0)
             {
+                /*
+                   retry handling
+                */
+
+                if(clients[i].last_ack_id !=
+                   clients[i].last_msg_id)
+                {
+                    clients[i].retry_count++;
+
+                    printf("[SERVER] Retry fd=%d count=%d\n",
+                           clients[i].fd,
+                           clients[i].retry_count);
+
+                    if(clients[i].retry_count > 3)
+                    {
+                        printf("[SERVER] Removing unresponsive client fd=%d\n",
+                               clients[i].fd);
+
+                        remove_client(i);
+                    }
+                }
+
                 continue;
             }
 
@@ -150,10 +189,13 @@ void *consumer_thread(void *arg)
             clients[i].write_offset = 0;
 
             clients[i].last_msg_id =
-                global_msg_id;
+                msg_id;
+
+            clients[i].retry_count = 0;
         }
 
-        pthread_mutex_unlock(&client_mutex);
+        pthread_mutex_unlock(
+            &client_mutex);
     }
 
     return NULL;
@@ -163,7 +205,8 @@ void *heartbeat_thread(void *arg)
 {
     while(running)
     {
-        pthread_mutex_lock(&client_mutex);
+        pthread_mutex_lock(
+            &client_mutex);
 
         for(int i = 0;
             i < MAX_CLIENTS;
@@ -189,24 +232,25 @@ void *heartbeat_thread(void *arg)
             }
 
             /*
-               outbuf free aanengil mathram
-               PING ayakkuka
+               send ping only when
+               buffer free
             */
 
             if(clients[i].outlen == 0)
             {
-                strncpy(clients[i].outbuf,
-                        "PING\n",
-                        BUFFER_SIZE);
+                create_ping_packet(
+                    clients[i].outbuf);
 
                 clients[i].outlen =
-                    strlen("PING\n");
+                    strlen(
+                        clients[i].outbuf);
 
                 clients[i].write_offset = 0;
             }
         }
 
-        pthread_mutex_unlock(&client_mutex);
+        pthread_mutex_unlock(
+            &client_mutex);
 
         sleep(5);
     }
@@ -385,7 +429,8 @@ int main()
                     continue;
                 }
 
-                set_nonblocking(client_fd);
+                set_nonblocking(
+                    client_fd);
 
                 int idx;
 
@@ -425,7 +470,8 @@ int main()
                 int fd =
                     events[i].data.fd;
 
-                pthread_mutex_lock(&client_mutex);
+                pthread_mutex_lock(
+                    &client_mutex);
 
                 for(int j = 0;
                     j < MAX_CLIENTS;
@@ -435,19 +481,19 @@ int main()
                        clients[j].fd == fd)
                     {
                         /*
-                           ACK/PONG receive
+                           receive engine
                         */
 
                         if(events[i].events &
                            EPOLLIN)
                         {
-                            char ackbuf[128];
+                            char recvbuf[256];
 
                             int n;
 
                             n = recv(fd,
-                                     ackbuf,
-                                     sizeof(ackbuf) - 1,
+                                     recvbuf,
+                                     sizeof(recvbuf) - 1,
                                      0);
 
                             if(n <= 0)
@@ -460,13 +506,15 @@ int main()
                                 continue;
                             }
 
-                            ackbuf[n] = '\0';
+                            recvbuf[n] = '\0';
 
                             int ack_id;
 
-                            if(sscanf(ackbuf,
-                                      "ACK=%d",
-                                      &ack_id) == 1)
+                            ack_id =
+                                parse_ack_packet(
+                                    recvbuf);
+
+                            if(ack_id >= 0)
                             {
                                 clients[j].last_ack_id =
                                     ack_id;
@@ -476,14 +524,13 @@ int main()
                                 clients[j].last_heartbeat =
                                     time(NULL);
 
-                                printf("[SERVER] ACK received fd=%d ACK=%d\n",
+                                printf("[SERVER] ACK fd=%d id=%d\n",
                                        fd,
                                        ack_id);
                             }
 
-                            if(strncmp(ackbuf,
-                                       "PONG",
-                                       4) == 0)
+                            if(is_pong_packet(
+                                   recvbuf))
                             {
                                 clients[j].last_heartbeat =
                                     time(NULL);
@@ -544,7 +591,8 @@ int main()
                     }
                 }
 
-                pthread_mutex_unlock(&client_mutex);
+                pthread_mutex_unlock(
+                    &client_mutex);
             }
         }
     }

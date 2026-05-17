@@ -5,6 +5,8 @@
 #include <sys/socket.h>
 #include <string.h>
 
+#include "protocol.h"
+
 #define SERVER_IP "127.0.0.1"
 
 #define PORT 8080
@@ -79,18 +81,19 @@ int main()
            heartbeat reply
         */
 
-        if(strncmp(buffer,
-                   "PING",
-                   4) == 0)
+        if(is_ping_packet(buffer))
         {
-            char pong[] = "PONG\n";
+            char pong[64];
+
+            create_pong_packet(pong);
 
             send(sockfd,
                  pong,
                  strlen(pong),
                  0);
 
-            printf("[CLIENT] Sent: PONG\n");
+            printf("[CLIENT] Sent: %s",
+                   pong);
 
             continue;
         }
@@ -101,16 +104,15 @@ int main()
 
         int msg_id;
 
-        if(sscanf(buffer,
-                  "ID=%d",
-                  &msg_id) == 1)
+        msg_id =
+            parse_sensor_packet(buffer);
+
+        if(msg_id >= 0)
         {
             char ackbuf[64];
 
-            snprintf(ackbuf,
-                     sizeof(ackbuf),
-                     "ACK=%d\n",
-                     msg_id);
+            create_ack_packet(ackbuf,
+                              msg_id);
 
             send(sockfd,
                  ackbuf,
