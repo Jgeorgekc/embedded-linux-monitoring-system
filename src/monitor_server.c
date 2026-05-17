@@ -12,30 +12,25 @@
 
 #include "shared_mem.h"
 #include "message_queue.h"
+#include "client_manager.h"
 
 #define PORT 8080
 #define MAX_EVENTS 100
 
 sensor_data_t *shared_data;
+
 message_queue_t queue;
-
-#define MAX_CLIENTS 100
-
-int clients[MAX_CLIENTS];
-
-int client_count = 0;
 
 pthread_mutex_t client_mutex =
     PTHREAD_MUTEX_INITIALIZER;
-    
 
 int running = 1;
-int client_id = 0;
 
 void signal_handler(int sig)
 {
     running = 0;
 }
+
 int set_nonblocking(int fd)
 {
     int flags;
@@ -53,6 +48,7 @@ int set_nonblocking(int fd)
                  F_SETFL,
                  flags | O_NONBLOCK);
 }
+
 void *producer_thread(void *arg)
 {
     int last_temp = -1;
@@ -63,9 +59,14 @@ void *producer_thread(void *arg)
     {
         pthread_mutex_lock(&shared_data->mutex);
 
-        int temp = shared_data->temperature;
-        int hum = shared_data->humidity;
-        int press = shared_data->pressure;
+        int temp =
+            shared_data->temperature;
+
+        int hum =
+            shared_data->humidity;
+
+        int press =
+            shared_data->pressure;
 
         pthread_mutex_unlock(&shared_data->mutex);
 
@@ -89,7 +90,9 @@ void *producer_thread(void *arg)
                    buffer);
 
             last_temp = temp;
+
             last_hum = hum;
+
             last_press = press;
         }
 
@@ -98,6 +101,7 @@ void *producer_thread(void *arg)
 
     return NULL;
 }
+
 void *consumer_thread(void *arg)
 {
     while(running)
@@ -108,58 +112,47 @@ void *consumer_thread(void *arg)
                 msg);
 
         printf("[QUEUE] Broadcasting: %s",
-        msg);
+               msg);
 
         pthread_mutex_lock(&client_mutex);
 
-        for(int i = 0; i < MAX_CLIENTS; i++)
+        for(int i = 0;
+            i < MAX_CLIENTS;
+            i++)
         {
-            int ret;
-
-            if(clients[i] == -1)
+            if(clients[i].active == 0)
             {
                 continue;
             }
-            ret = send(clients[i],
+
+            strncpy(clients[i].outbuf,
                     msg,
-                    strlen(msg),
-                    0);
+                    BUFFER_SIZE);
 
-            if(ret <= 0)
-            {
-                printf("[SERVER] Client disconnected\n");
-                printf("[SERVER] Removing client %d\n",
-                clients[i]);
-
-                close(clients[i]);
-
-                clients[i] = -1;
-            }
+            clients[i].outlen =
+                strlen(msg);
         }
 
         pthread_mutex_unlock(&client_mutex);
-
-        /*
-           ivide later:
-           broadcast to all clients
-           epoll integration
-        */
     }
 
     return NULL;
 }
+
 int main()
 {
-    signal(SIGINT, signal_handler);
-    signal(SIGPIPE, SIG_IGN);
-    
+    signal(SIGINT,
+           signal_handler);
+
+    signal(SIGPIPE,
+           SIG_IGN);
+
     queue_init(&queue);
 
-    for(int i = 0; i < MAX_CLIENTS; i++)
-    {
-        clients[i] = -1;
-    }
-    shared_data = get_shared_memory();
+    init_clients();
+
+    shared_data =
+        get_shared_memory();
 
     if(shared_data == NULL)
     {
@@ -168,13 +161,15 @@ int main()
 
     int server_fd;
 
-    server_fd = socket(AF_INET,
-                       SOCK_STREAM,
-                       0);
+    server_fd =
+        socket(AF_INET,
+               SOCK_STREAM,
+               0);
 
     if(server_fd < 0)
     {
         perror("socket");
+
         return -1;
     }
 
@@ -188,11 +183,17 @@ int main()
 
     struct sockaddr_in addr;
 
-    memset(&addr, 0, sizeof(addr));
+    memset(&addr,
+           0,
+           sizeof(addr));
 
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    addr.sin_addr.s_addr = INADDR_ANY;
+
+    addr.sin_port =
+        htons(PORT);
+
+    addr.sin_addr.s_addr =
+        INADDR_ANY;
 
     if(bind(server_fd,
             (struct sockaddr *)&addr,
@@ -203,15 +204,19 @@ int main()
         return -1;
     }
 
-    if(listen(server_fd, 10) < 0)
+    if(listen(server_fd,
+              10) < 0)
     {
         perror("listen");
 
         return -1;
     }
 
-    printf("[SERVER] Listening on port %d\n", PORT);
+    printf("[SERVER] Listening on port %d\n",
+           PORT);
+
     set_nonblocking(server_fd);
+
     int epfd;
 
     epfd = epoll_create1(0);
@@ -224,6 +229,7 @@ int main()
     }
 
     struct epoll_event ev;
+
     struct epoll_event events[MAX_EVENTS];
 
     ev.events = EPOLLIN;
@@ -231,30 +237,32 @@ int main()
     ev.data.fd = server_fd;
 
     epoll_ctl(epfd,
-            EPOLL_CTL_ADD,
-            server_fd,
-            &ev);
+              EPOLL_CTL_ADD,
+              server_fd,
+              &ev);
+
     pthread_t prod_tid;
+
     pthread_t cons_tid;
 
     pthread_create(&prod_tid,
-               NULL,
-               producer_thread,
-               NULL);
+                   NULL,
+                   producer_thread,
+                   NULL);
 
     pthread_create(&cons_tid,
-               NULL,
-               consumer_thread,
-               NULL);
+                   NULL,
+                   consumer_thread,
+                   NULL);
 
     while(running)
     {
         int nfds;
 
         nfds = epoll_wait(epfd,
-                        events,
-                        MAX_EVENTS,
-                        -1);
+                          events,
+                          MAX_EVENTS,
+                          -1);
 
         if(nfds < 0)
         {
@@ -268,20 +276,25 @@ int main()
             break;
         }
 
-        for(int i = 0; i < nfds; i++)
+        for(int i = 0;
+            i < nfds;
+            i++)
         {
-            if(events[i].data.fd == server_fd)
+            if(events[i].data.fd ==
+               server_fd)
             {
-                struct sockaddr_in client_addr;
+                struct sockaddr_in
+                    client_addr;
 
                 socklen_t client_len =
                     sizeof(client_addr);
 
                 int client_fd;
 
-                client_fd = accept(server_fd,
-                                (struct sockaddr *)&client_addr,
-                                &client_len);
+                client_fd =
+                    accept(server_fd,
+                           (struct sockaddr *)&client_addr,
+                           &client_len);
 
                 if(client_fd < 0)
                 {
@@ -292,36 +305,83 @@ int main()
 
                 set_nonblocking(client_fd);
 
-                printf("[SERVER] New client connected fd=%d\n",
-                    client_fd);
+                int idx;
 
-                pthread_mutex_lock(&client_mutex);
+                idx =
+                    add_client(client_fd);
 
-                int added = 0;
-
-                for(int j = 0; j < MAX_CLIENTS; j++)
-                {
-                    if(clients[j] == -1)
-                    {
-                        clients[j] = client_fd;
-
-                        added = 1;
-
-                        break;
-                    }
-                }
-
-                pthread_mutex_unlock(&client_mutex);
-
-                if(!added)
+                if(idx < 0)
                 {
                     printf("[SERVER] Max clients reached\n");
 
                     close(client_fd);
+
+                    continue;
                 }
+
+                printf("[SERVER] Client added idx=%d fd=%d\n",
+                       idx,
+                       client_fd);
+
+                struct epoll_event
+                    client_ev;
+
+                client_ev.events =
+                    EPOLLIN |
+                    EPOLLOUT;
+
+                client_ev.data.fd =
+                    client_fd;
+
+                epoll_ctl(epfd,
+                          EPOLL_CTL_ADD,
+                          client_fd,
+                          &client_ev);
+            }
+            else
+            {
+                int fd =
+                    events[i].data.fd;
+
+                pthread_mutex_lock(&client_mutex);
+
+                for(int j = 0;
+                    j < MAX_CLIENTS;
+                    j++)
+                {
+                    if(clients[j].active &&
+                       clients[j].fd == fd)
+                    {
+                        if(clients[j].outlen > 0)
+                        {
+                            int ret;
+
+                            ret =
+                                send(fd,
+                                     clients[j].outbuf,
+                                     clients[j].outlen,
+                                     0);
+
+                            if(ret <= 0)
+                            {
+                                printf("[SERVER] Removing client fd=%d\n",
+                                       fd);
+
+                                remove_client(j);
+                            }
+                            else
+                            {
+                                clients[j].outlen = 0;
+                            }
+                        }
+                    }
+                }
+
+                pthread_mutex_unlock(&client_mutex);
             }
         }
     }
+
     close(server_fd);
 
     return 0;
