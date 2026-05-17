@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/epoll.h>
 #include <fcntl.h>
+#include <time.h>
 
 #include "shared_mem.h"
 #include "message_queue.h"
@@ -25,6 +26,8 @@ pthread_mutex_t client_mutex =
     PTHREAD_MUTEX_INITIALIZER;
 
 int running = 1;
+
+int global_msg_id = 0;
 
 void signal_handler(int sig)
 {
@@ -76,9 +79,12 @@ void *producer_thread(void *arg)
         {
             char buffer[256];
 
+            global_msg_id++;
+
             snprintf(buffer,
                      sizeof(buffer),
-                     "TEMP=%d HUM=%d PRESS=%d\n",
+                     "ID=%d TEMP=%d HUM=%d PRESS=%d\n",
+                     global_msg_id,
                      temp,
                      hum,
                      press);
@@ -125,15 +131,84 @@ void *consumer_thread(void *arg)
                 continue;
             }
 
+            /*
+               overwrite avoid cheyyan
+            */
+
+            if(clients[i].outlen > 0)
+            {
+                continue;
+            }
+
             strncpy(clients[i].outbuf,
                     msg,
                     BUFFER_SIZE);
 
             clients[i].outlen =
                 strlen(msg);
+
+            clients[i].write_offset = 0;
+
+            clients[i].last_msg_id =
+                global_msg_id;
         }
 
         pthread_mutex_unlock(&client_mutex);
+    }
+
+    return NULL;
+}
+
+void *heartbeat_thread(void *arg)
+{
+    while(running)
+    {
+        pthread_mutex_lock(&client_mutex);
+
+        for(int i = 0;
+            i < MAX_CLIENTS;
+            i++)
+        {
+            if(clients[i].active == 0)
+            {
+                continue;
+            }
+
+            time_t now =
+                time(NULL);
+
+            if(now -
+               clients[i].last_heartbeat > 15)
+            {
+                printf("[SERVER] Heartbeat timeout fd=%d\n",
+                       clients[i].fd);
+
+                remove_client(i);
+
+                continue;
+            }
+
+            /*
+               outbuf free aanengil mathram
+               PING ayakkuka
+            */
+
+            if(clients[i].outlen == 0)
+            {
+                strncpy(clients[i].outbuf,
+                        "PING\n",
+                        BUFFER_SIZE);
+
+                clients[i].outlen =
+                    strlen("PING\n");
+
+                clients[i].write_offset = 0;
+            }
+        }
+
+        pthread_mutex_unlock(&client_mutex);
+
+        sleep(5);
     }
 
     return NULL;
@@ -245,6 +320,8 @@ int main()
 
     pthread_t cons_tid;
 
+    pthread_t hb_tid;
+
     pthread_create(&prod_tid,
                    NULL,
                    producer_thread,
@@ -253,6 +330,11 @@ int main()
     pthread_create(&cons_tid,
                    NULL,
                    consumer_thread,
+                   NULL);
+
+    pthread_create(&hb_tid,
+                   NULL,
+                   heartbeat_thread,
                    NULL);
 
     while(running)
@@ -352,26 +434,111 @@ int main()
                     if(clients[j].active &&
                        clients[j].fd == fd)
                     {
+                        /*
+                           ACK/PONG receive
+                        */
+
+                        if(events[i].events &
+                           EPOLLIN)
+                        {
+                            char ackbuf[128];
+
+                            int n;
+
+                            n = recv(fd,
+                                     ackbuf,
+                                     sizeof(ackbuf) - 1,
+                                     0);
+
+                            if(n <= 0)
+                            {
+                                printf("[SERVER] Client disconnected fd=%d\n",
+                                       fd);
+
+                                remove_client(j);
+
+                                continue;
+                            }
+
+                            ackbuf[n] = '\0';
+
+                            int ack_id;
+
+                            if(sscanf(ackbuf,
+                                      "ACK=%d",
+                                      &ack_id) == 1)
+                            {
+                                clients[j].last_ack_id =
+                                    ack_id;
+
+                                clients[j].retry_count = 0;
+
+                                clients[j].last_heartbeat =
+                                    time(NULL);
+
+                                printf("[SERVER] ACK received fd=%d ACK=%d\n",
+                                       fd,
+                                       ack_id);
+                            }
+
+                            if(strncmp(ackbuf,
+                                       "PONG",
+                                       4) == 0)
+                            {
+                                clients[j].last_heartbeat =
+                                    time(NULL);
+
+                                printf("[SERVER] PONG fd=%d\n",
+                                       fd);
+                            }
+                        }
+
+                        /*
+                           async send engine
+                        */
+
                         if(clients[j].outlen > 0)
                         {
+                            int remaining;
+
+                            remaining =
+                                clients[j].outlen -
+                                clients[j].write_offset;
+
                             int ret;
 
                             ret =
                                 send(fd,
-                                     clients[j].outbuf,
-                                     clients[j].outlen,
+                                     clients[j].outbuf +
+                                     clients[j].write_offset,
+                                     remaining,
                                      0);
 
-                            if(ret <= 0)
+                            if(ret < 0)
                             {
+                                if(errno == EAGAIN ||
+                                   errno == EWOULDBLOCK)
+                                {
+                                    continue;
+                                }
+
                                 printf("[SERVER] Removing client fd=%d\n",
                                        fd);
 
                                 remove_client(j);
+
+                                continue;
                             }
-                            else
+
+                            clients[j].write_offset +=
+                                ret;
+
+                            if(clients[j].write_offset >=
+                               clients[j].outlen)
                             {
                                 clients[j].outlen = 0;
+
+                                clients[j].write_offset = 0;
                             }
                         }
                     }
